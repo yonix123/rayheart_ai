@@ -189,7 +189,6 @@ class ECGHardware:
         self.i2c = busio.I2C(board.SCL, board.SDA)
         self.ads = ADS.ADS1115(self.i2c)
         self.ads.data_rate = 860
-        self.ads.gain = ADS.Gain.ONE
         self.ch0 = AnalogIn(self.ads, ADS.P2)
         self.ch1 = AnalogIn(self.ads, ADS.P3)
         GPIO.setmode(GPIO.BCM)
