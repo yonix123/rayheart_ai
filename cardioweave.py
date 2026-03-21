@@ -5,7 +5,7 @@ CardioWeave — Unified ECG Recorder + MI Detection
 Hardware : 2x AD8232 + ADS1115 + Raspberry Pi
 Leads    : V1-V4 (chip 1), V3-V5 (chip 2)
 AI       : Random Forest MI detector, inference every 60s
-Alerts   : PyQtGraph display + WebSocket to phone browser
+Alerts   : Matplotlib display + WebSocket to phone browser
 
 WIRING QUICK REFERENCE:
   ADS1115 SDA  → GPIO2  (Pin 3)
@@ -22,14 +22,14 @@ WIRING QUICK REFERENCE:
 
 INSTALL ON PI:
   pip install adafruit-circuitpython-ads1x15 RPi.GPIO
-  pip install numpy scipy scikit-learn pyqtgraph PyQt5
+  pip install numpy scipy scikit-learn matplotlib
   pip install websockets pyEDFlib
 
 RUN:
   python cardioweave.py
 
 PHONE BROWSER:
-  Open http://<pi-ip-address>:8765 on any device on same WiFi
+  Open http://<pi-ip-address>:8766 on any device on same WiFi
 """
 
 import sys, os, time, threading, asyncio, datetime, json, pickle
@@ -37,9 +37,12 @@ import numpy as np
 from collections import deque
 from scipy.signal import butter, sosfilt, sosfilt_zi, iirnotch
 
-# ── Display ────────────────────────────────────────────────────────────────
-import pyqtgraph as pg
-from pyqtgraph.Qt import QtWidgets, QtCore, QtGui
+# ── Display (matplotlib — works on Pi without Qt) ─────────────────────────
+import matplotlib
+matplotlib.use("TkAgg")          # works on Pi desktop; fall back to Agg if headless
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from matplotlib.gridspec import GridSpec
 
 # ── Storage ────────────────────────────────────────────────────────────────
 import pyedflib
@@ -63,15 +66,15 @@ import websockets
 
 SAMPLE_RATE      = 500          # Hz
 DISPLAY_WINDOW   = 5            # seconds shown on screen
-DISPLAY_FPS      = 30           # screen refresh rate
+DISPLAY_FPS      = 20           # screen refresh rate
 MAINS_HZ         = 50           # notch filter frequency
 INFERENCE_EVERY  = 60           # seconds between AI inference runs
-ALERT_THRESHOLD  = 0.55        # from threshold optimizer
-MODEL_DIR        = "/Users/rauanakendirbayeva/Desktop/rayheart_ai/models/"         # same folder as this script
+ALERT_THRESHOLD  = 0.55         # from threshold optimizer
+MODEL_DIR        = "./models/"  # same folder as this script
 WS_PORT          = 8765         # WebSocket port for phone browser
 RECORDINGS_DIR   = os.path.expanduser("~/ecg_recordings")
 
-LO_PINS = {"p1": 17, "n1": 27, "p2": 22, "n2": 23}
+LO_PINS     = {"p1": 17, "n1": 27, "p2": 22, "n2": 23}
 LEAD_NAMES  = ["chip1 (V1-V4)", "chip2 (V3-V5)"]
 LEAD_COLORS = ["#00ff88", "#00ccff"]
 
@@ -91,7 +94,11 @@ def make_filters(fs):
 #  FEATURE EXTRACTION (must match training exactly)
 # =============================================================================
 
-def extract_features(chip1_sig, chip2_sig, fs):
+def extract_features(chip1_sig, chip2_sig, fs=100):
+    """
+    Extract 36 features — hardcoded to 100 Hz to match training.
+    Input signals must already be resampled to 100 Hz before calling.
+    """
     features = []
     for sig in [chip1_sig, chip2_sig]:
         features.extend([
@@ -101,20 +108,20 @@ def extract_features(chip1_sig, chip2_sig, fs):
             np.mean(np.abs(sig - np.mean(sig))),
         ])
         fft_v  = np.abs(np.fft.rfft(sig))
-        freqs  = np.fft.rfftfreq(len(sig), d=1.0 / fs)
+        freqs  = np.fft.rfftfreq(len(sig), d=1.0 / 100)   # hardcoded 100 Hz
         qrs_b  = fft_v[(freqs >= 5)  & (freqs <= 40)]
         st_b   = fft_v[(freqs >= 0.5) & (freqs <= 5)]
         ns_b   = fft_v[freqs > 40]
         features.extend([
-            np.sum(qrs_b**2) if len(qrs_b) > 0 else 0,
-            np.sum(st_b**2)  if len(st_b)  > 0 else 0,
-            np.sum(ns_b**2)  if len(ns_b)  > 0 else 0,
-            float(np.argmax(fft_v)),
+            np.sum(qrs_b**2),
+            np.sum(st_b**2),
+            np.sum(ns_b**2),
+            np.argmax(fft_v),           # int, matches training
         ])
-        ms = fs / 1000.0
+        # ST segment: hardcoded 6 / 12 samples (60 / 120 ms at 100 Hz)
         pk = int(np.argmax(np.abs(sig)))
-        ss = min(pk + int(60  * ms), len(sig) - 1)
-        se = min(pk + int(120 * ms), len(sig))
+        ss = min(pk + 6,  len(sig) - 1)
+        se = min(pk + 12, len(sig))
         st = sig[ss:se]
         features.extend([
             np.mean(st) if len(st) > 0 else 0,
@@ -155,9 +162,14 @@ class MIPredictor:
     def predict(self, chip1_buf, chip2_buf):
         if len(chip1_buf) < 100:
             return {"probability": 0.0, "alert": False, "message": "Not enough data"}
+        from scipy.signal import resample as sp_resample
         c1 = np.array(chip1_buf, dtype=np.float64)
         c2 = np.array(chip2_buf, dtype=np.float64)
-        feats = extract_features(c1, c2, SAMPLE_RATE).reshape(1, -1)
+        # Resample from acquisition rate to 100 Hz (training rate)
+        target = int(len(c1) * 100 / SAMPLE_RATE)
+        c1 = sp_resample(c1, target)
+        c2 = sp_resample(c2, target)
+        feats        = extract_features(c1, c2).reshape(1, -1)
         feats_scaled = self.scaler.transform(feats)
         prob  = float(self.model.predict_proba(feats_scaled)[0, 1])
         alert = prob >= ALERT_THRESHOLD
@@ -197,7 +209,7 @@ class ECGHardware:
 
 
 class MockHardware:
-    """Fake hardware for testing on Mac — generates synthetic ECG."""
+    """Fake hardware for testing — generates synthetic ECG."""
     def __init__(self):
         self._t = 0.0
         print("[MOCK] Using synthetic ECG data")
@@ -229,18 +241,15 @@ class AcquisitionThread(threading.Thread):
         self.disp_c1 = deque([0.0] * win, maxlen=win)
         self.disp_c2 = deque([0.0] * win, maxlen=win)
 
-        # Inference buffers — 60 seconds
         inf_win = INFERENCE_EVERY * SAMPLE_RATE
         self.inf_c1 = deque(maxlen=inf_win)
         self.inf_c2 = deque(maxlen=inf_win)
 
-        # Recording buffers
-        self.rec_c1     = []
-        self.rec_c2     = []
-        self.recording  = False
-        self.rec_start  = None
+        self.rec_c1    = []
+        self.rec_c2    = []
+        self.recording = False
+        self.rec_start = None
 
-        # Filters
         sos_bp, sos_n = make_filters(SAMPLE_RATE)
         self.sos_bp, self.sos_n = sos_bp, sos_n
         self.zi_bp = [sosfilt_zi(sos_bp) * 0 for _ in range(2)]
@@ -251,10 +260,8 @@ class AcquisitionThread(threading.Thread):
 
     def run(self):
         self.running = True
-        # Warm up filters
         for _ in range(200):
             self._process(0.0, 0.0)
-
         while self.running:
             t0 = time.perf_counter()
             raw, lo = self.hw.read()
@@ -336,17 +343,14 @@ def save_edf(c1, c2, start_time):
 
 
 # =============================================================================
-#  WEBSOCKET SERVER  (runs in background asyncio loop)
+#  WEBSOCKET SERVER
 # =============================================================================
 
 class WSServer:
     def __init__(self):
-        self.clients  = set()
-        self.loop     = asyncio.new_event_loop()
-        self._thread  = threading.Thread(target=self._run, daemon=True)
-
-    def start(self):
-        self._thread.start()
+        self.clients = set()
+        self.loop    = asyncio.new_event_loop()
+        threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
         asyncio.set_event_loop(self.loop)
@@ -354,12 +358,11 @@ class WSServer:
 
     async def _serve(self):
         async with websockets.serve(self._handler, "0.0.0.0", WS_PORT):
-            print(f"[WS] Server running on port {WS_PORT}")
-            await asyncio.Future()  # run forever
+            print(f"[WS] Server on port {WS_PORT}")
+            await asyncio.Future()
 
     async def _handler(self, ws):
         self.clients.add(ws)
-        # Send the phone browser the HTML dashboard on connect
         try:
             await ws.send(json.dumps({"type": "init", "threshold": ALERT_THRESHOLD}))
             await ws.wait_closed()
@@ -367,13 +370,12 @@ class WSServer:
             self.clients.discard(ws)
 
     def broadcast(self, payload: dict):
-        """Send a message to all connected phone browsers."""
         if not self.clients:
             return
         msg = json.dumps(payload)
-        asyncio.run_coroutine_threadsafe(self._broadcast(msg), self.loop)
+        asyncio.run_coroutine_threadsafe(self._bcast(msg), self.loop)
 
-    async def _broadcast(self, msg):
+    async def _bcast(self, msg):
         dead = set()
         for ws in self.clients:
             try:
@@ -384,12 +386,11 @@ class WSServer:
 
 
 # =============================================================================
-#  INFERENCE THREAD  (runs every 60 seconds)
+#  INFERENCE THREAD
 # =============================================================================
 
 class InferenceThread(threading.Thread):
-    def __init__(self, acq: AcquisitionThread,
-                 predictor: MIPredictor, ws: WSServer):
+    def __init__(self, acq, predictor, ws):
         super().__init__(daemon=True)
         self.acq       = acq
         self.predictor = predictor
@@ -407,7 +408,6 @@ class InferenceThread(threading.Thread):
             with self.lock:
                 self.last_result = result
             print(f"[AI] {result['message']}")
-            # Push to phone
             self.ws.broadcast({
                 "type":        "inference",
                 "probability": round(result["probability"], 4),
@@ -425,246 +425,163 @@ class InferenceThread(threading.Thread):
 
 
 # =============================================================================
-#  DISPLAY
+#  DISPLAY  — matplotlib (no Qt dependency)
 # =============================================================================
 
 class ECGDisplay:
-    def __init__(self, acq: AcquisitionThread,
-                 inference: InferenceThread, ws: WSServer):
+    def __init__(self, acq, inference, ws):
         self.acq       = acq
         self.inference = inference
         self.ws        = ws
         self.is_recording = False
+        self._next_inf = time.time() + INFERENCE_EVERY
 
-        self.app = QtWidgets.QApplication(sys.argv)
-        self.app.setStyle("Fusion")
-        p = QtGui.QPalette()
-        p.setColor(QtGui.QPalette.Window, QtGui.QColor(10, 14, 14))
-        p.setColor(QtGui.QPalette.WindowText, QtGui.QColor(200, 220, 220))
-        self.app.setPalette(p)
+        plt.style.use("dark_background")
+        self.fig = plt.figure(figsize=(13, 7), facecolor="#0a0e0e")
+        self.fig.canvas.manager.set_window_title("CardioWeave — Live ECG")
 
-        self.win = QtWidgets.QMainWindow()
-        self.win.setWindowTitle("CardioWeave — Live ECG")
-        self.win.resize(1280, 700)
+        gs = GridSpec(3, 1, figure=self.fig,
+                      height_ratios=[2, 2, 1],
+                      hspace=0.35,
+                      top=0.92, bottom=0.08, left=0.08, right=0.97)
 
-        central = QtWidgets.QWidget()
-        self.win.setCentralWidget(central)
-        layout = QtWidgets.QVBoxLayout(central)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
+        n = DISPLAY_WINDOW * SAMPLE_RATE
+        x = np.arange(n) / SAMPLE_RATE   # time axis in seconds
 
-        # ── Status bar ────────────────────────────────────────────────────
-        top = QtWidgets.QHBoxLayout()
+        # ── Lead plots ────────────────────────────────────────────────────
+        self.axes  = []
+        self.lines = []
+        colors = ["#00ff88", "#00ccff"]
+        for i in range(2):
+            ax = self.fig.add_subplot(gs[i])
+            ax.set_facecolor("#0a0e0e")
+            ax.set_xlim(0, DISPLAY_WINDOW)
+            ax.set_ylim(-2.5, 2.5)
+            ax.set_ylabel(LEAD_NAMES[i], color=colors[i], fontsize=9)
+            ax.tick_params(colors="#445555", labelsize=7)
+            ax.grid(True, color="#1a2a2a", linewidth=0.5)
+            ax.axhline(0, color="#334444", linewidth=0.5)
+            for sp in ax.spines.values():
+                sp.set_color("#223333")
+            line, = ax.plot(x, np.zeros(n), color=colors[i],
+                            linewidth=0.9, antialiased=True)
+            self.axes.append(ax)
+            self.lines.append(line)
 
-        self.lbl_status = QtWidgets.QLabel("● LIVE")
-        self.lbl_status.setStyleSheet(
-            "color:#00ff88; font-size:13px; font-weight:bold;")
+        # ── Status panel ─────────────────────────────────────────────────
+        ax_info = self.fig.add_subplot(gs[2])
+        ax_info.set_facecolor("#0a0e0e")
+        ax_info.axis("off")
 
-        self.lbl_lo = QtWidgets.QLabel("")
-        self.lbl_lo.setStyleSheet(
-            "color:#ff4444; font-size:12px; font-weight:bold;")
+        self.txt_status = ax_info.text(
+            0.01, 0.75, "● LIVE", color="#00ff88",
+            fontsize=12, fontweight="bold", transform=ax_info.transAxes)
+        self.txt_lo = ax_info.text(
+            0.20, 0.75, "", color="#ff4444",
+            fontsize=11, fontweight="bold", transform=ax_info.transAxes)
+        self.txt_ai = ax_info.text(
+            0.01, 0.35, "AI: waiting for first window...",
+            color="#888888", fontsize=11, transform=ax_info.transAxes)
+        self.txt_next = ax_info.text(
+            0.01, 0.05, "", color="#555555",
+            fontsize=9, transform=ax_info.transAxes)
+        self.txt_rec = ax_info.text(
+            0.70, 0.75, "", color="#ff4444",
+            fontsize=10, fontweight="bold", transform=ax_info.transAxes)
+        self.txt_saved = ax_info.text(
+            0.70, 0.35, "", color="#556666",
+            fontsize=9, transform=ax_info.transAxes)
 
-        self.lbl_ai = QtWidgets.QLabel("AI: waiting for first window...")
-        self.lbl_ai.setStyleSheet(
-            "color:#888888; font-size:13px;")
+        # Key bindings
+        self.fig.canvas.mpl_connect("key_press_event", self._on_key)
 
-        self.lbl_next = QtWidgets.QLabel("")
-        self.lbl_next.setStyleSheet(
-            "color:#888888; font-size:11px;")
+        # Instructions
+        self.fig.text(0.5, 0.01,
+                      "Press  R = start/stop recording   Q = quit",
+                      ha="center", color="#445555", fontsize=9)
 
-        top.addWidget(self.lbl_status)
-        top.addStretch()
-        top.addWidget(self.lbl_lo)
-        top.addStretch()
-        top.addWidget(self.lbl_ai)
-        top.addSpacing(16)
-        top.addWidget(self.lbl_next)
-        layout.addLayout(top)
+        # Title
+        self.fig.suptitle("CardioWeave — ECG Monitor",
+                          color="#00ff88", fontsize=13, fontweight="bold")
 
-        # ── Alert banner (hidden by default) ──────────────────────────────
-        self.alert_banner = QtWidgets.QLabel("")
-        self.alert_banner.setAlignment(QtCore.Qt.AlignCenter)
-        self.alert_banner.setStyleSheet(
-            "background:#3a0000; color:#ff4444; font-size:16px; "
-            "font-weight:bold; padding:8px; border-radius:4px;")
-        self.alert_banner.hide()
-        layout.addWidget(self.alert_banner)
+    def _on_key(self, event):
+        if event.key in ("r", "R"):
+            self._toggle_recording()
+        elif event.key in ("q", "Q"):
+            self._quit()
 
-        # ── ECG plots ─────────────────────────────────────────────────────
-        self.gw = pg.GraphicsLayoutWidget()
-        self.gw.setBackground("#0a0e0e")
-        layout.addWidget(self.gw, stretch=1)
-
-        x = np.arange(DISPLAY_WINDOW * SAMPLE_RATE)
-        self.curves = []
-        for i, (name, color) in enumerate(zip(LEAD_NAMES, LEAD_COLORS)):
-            p = self.gw.addPlot(row=i, col=0)
-            p.setYRange(-2.0, 2.0)
-            p.setXRange(0, DISPLAY_WINDOW * SAMPLE_RATE)
-            p.hideAxis("bottom")
-            p.setLabel("left", name, color=color, size="10pt")
-            p.getAxis("left").setWidth(80)
-            p.showGrid(x=True, y=True, alpha=0.12)
-            p.addLine(y=0, pen=pg.mkPen("#334444", width=0.5))
-            curve = p.plot(x, np.zeros(len(x)),
-                           pen=pg.mkPen(color, width=1.2))
-            self.curves.append(curve)
-
-        # ── Probability bar ───────────────────────────────────────────────
-        prob_row = QtWidgets.QHBoxLayout()
-        prob_row.addWidget(QtWidgets.QLabel("MI probability:"))
-        self.prob_bar = QtWidgets.QProgressBar()
-        self.prob_bar.setRange(0, 100)
-        self.prob_bar.setValue(0)
-        self.prob_bar.setFixedHeight(20)
-        self.prob_bar.setStyleSheet(
-            "QProgressBar { border:1px solid #334; border-radius:3px; }"
-            "QProgressBar::chunk { background:#00ff88; border-radius:3px; }"
-        )
-        self.lbl_prob = QtWidgets.QLabel("0.0%")
-        self.lbl_prob.setStyleSheet("color:#00ff88; font-weight:bold; min-width:50px;")
-        prob_row.addWidget(self.prob_bar, stretch=1)
-        prob_row.addWidget(self.lbl_prob)
-        layout.addLayout(prob_row)
-
-        # ── Buttons ───────────────────────────────────────────────────────
-        btn_row = QtWidgets.QHBoxLayout()
-        self.btn_rec = QtWidgets.QPushButton("⏺  START RECORDING")
-        self.btn_rec.setFixedHeight(40)
-        self.btn_rec.setStyleSheet(
-            "QPushButton{background:#1a3a1a;color:#00ff88;"
-            "border:1px solid #00ff88;border-radius:4px;"
-            "font-size:13px;font-weight:bold;}"
-            "QPushButton:hover{background:#1f4f1f;}")
-        self.btn_rec.clicked.connect(self.toggle_recording)
-
-        self.lbl_saved = QtWidgets.QLabel("")
-        self.lbl_saved.setStyleSheet("color:#888; font-size:10px;")
-
-        btn_quit = QtWidgets.QPushButton("✕  QUIT")
-        btn_quit.setFixedHeight(40)
-        btn_quit.setFixedWidth(100)
-        btn_quit.setStyleSheet(
-            "QPushButton{background:#2a0a0a;color:#ff4444;"
-            "border:1px solid #ff4444;border-radius:4px;font-size:13px;}"
-            "QPushButton:hover{background:#3a0f0f;}")
-        btn_quit.clicked.connect(self.quit)
-
-        btn_row.addWidget(self.btn_rec)
-        btn_row.addWidget(self.lbl_saved)
-        btn_row.addStretch()
-        btn_row.addWidget(btn_quit)
-        layout.addLayout(btn_row)
-
-        # ── Timers ────────────────────────────────────────────────────────
-        self.disp_timer = QtCore.QTimer()
-        self.disp_timer.timeout.connect(self.update_display)
-        self.disp_timer.start(1000 // DISPLAY_FPS)
-
-        self.ai_timer = QtCore.QTimer()
-        self.ai_timer.timeout.connect(self.update_ai_panel)
-        self.ai_timer.start(2000)   # check AI result every 2s
-
-        self._next_inference = time.time() + INFERENCE_EVERY
-        self.rec_start_wall = None
-
-    def update_display(self):
-        c1, c2 = self.acq.get_display()
-        self.curves[0].setData(np.array(c1))
-        self.curves[1].setData(np.array(c2))
-
-        if self.acq.lo_flag:
-            self.lbl_lo.setText("⚠  ELECTRODE OFF")
-            self.lbl_status.setText("● LEAD OFF")
-            self.lbl_status.setStyleSheet(
-                "color:#ff4444;font-size:13px;font-weight:bold;")
-        else:
-            self.lbl_lo.setText("")
-            if self.is_recording:
-                elapsed = time.time() - self.rec_start_wall
-                m, s = divmod(int(elapsed), 60)
-                self.lbl_status.setText(f"● REC  {m:02d}:{s:02d}")
-                self.lbl_status.setStyleSheet(
-                    "color:#ff4444;font-size:13px;font-weight:bold;")
-            else:
-                self.lbl_status.setText("● LIVE")
-                self.lbl_status.setStyleSheet(
-                    "color:#00ff88;font-size:13px;font-weight:bold;")
-
-        secs_left = max(0, int(self._next_inference - time.time()))
-        self.lbl_next.setText(f"next AI check in {secs_left}s")
-
-    def update_ai_panel(self):
-        result = self.inference.get_result()
-        if result is None:
-            return
-
-        prob    = result["probability"]
-        alert   = result["alert"]
-        pct     = int(prob * 100)
-
-        self.prob_bar.setValue(pct)
-        self.lbl_prob.setText(f"{prob:.1%}")
-
-        if alert:
-            self.prob_bar.setStyleSheet(
-                "QProgressBar{border:1px solid #334;border-radius:3px;}"
-                "QProgressBar::chunk{background:#ff4444;border-radius:3px;}")
-            self.lbl_prob.setStyleSheet("color:#ff4444;font-weight:bold;min-width:50px;")
-            self.lbl_ai.setText(f"AI ALERT — {prob:.1%} MI probability")
-            self.lbl_ai.setStyleSheet("color:#ff4444;font-size:13px;font-weight:bold;")
-            self.alert_banner.setText(
-                f"MI SUSPECTED — {prob:.1%}   |   Seek medical attention immediately")
-            self.alert_banner.show()
-        else:
-            self.prob_bar.setStyleSheet(
-                "QProgressBar{border:1px solid #334;border-radius:3px;}"
-                "QProgressBar::chunk{background:#00ff88;border-radius:3px;}")
-            self.lbl_prob.setStyleSheet("color:#00ff88;font-weight:bold;min-width:50px;")
-            self.lbl_ai.setText(f"AI: Normal — {prob:.1%}")
-            self.lbl_ai.setStyleSheet("color:#00ff88;font-size:13px;")
-            self.alert_banner.hide()
-
-        self._next_inference = time.time() + INFERENCE_EVERY
-
-    def toggle_recording(self):
+    def _toggle_recording(self):
         if not self.is_recording:
             self.is_recording = True
-            self.rec_start_wall = time.time()
+            self._rec_wall = time.time()
             self.acq.start_recording()
-            self.btn_rec.setText("⏹  STOP & SAVE")
-            self.btn_rec.setStyleSheet(
-                "QPushButton{background:#3a0a0a;color:#ff4444;"
-                "border:1px solid #ff4444;border-radius:4px;"
-                "font-size:13px;font-weight:bold;}")
+            self.txt_rec.set_text("● REC")
         else:
             self.is_recording = False
             c1, c2, start = self.acq.stop_recording()
-            self.btn_rec.setText("⏺  START RECORDING")
-            self.btn_rec.setStyleSheet(
-                "QPushButton{background:#1a3a1a;color:#00ff88;"
-                "border:1px solid #00ff88;border-radius:4px;"
-                "font-size:13px;font-weight:bold;}")
+            self.txt_rec.set_text("")
             def _save():
                 path = save_edf(c1, c2, start)
-                self.lbl_saved.setText(f"Saved: {os.path.basename(path)}")
+                self.txt_saved.set_text(f"Saved: {os.path.basename(path)}")
             threading.Thread(target=_save, daemon=True).start()
 
-    def quit(self):
-        self.disp_timer.stop()
-        self.ai_timer.stop()
+    def _quit(self):
         self.acq.stop()
         self.inference.stop()
-        self.app.quit()
+        plt.close("all")
+
+    def _animate(self, _frame):
+        c1, c2 = self.acq.get_display()
+        self.lines[0].set_ydata(c1)
+        self.lines[1].set_ydata(c2)
+
+        # Lead-off
+        if self.acq.lo_flag:
+            self.txt_lo.set_text("⚠  ELECTRODE OFF")
+            self.txt_status.set_text("● LEAD OFF")
+            self.txt_status.set_color("#ff4444")
+        else:
+            self.txt_lo.set_text("")
+            if self.is_recording:
+                elapsed = time.time() - self._rec_wall
+                m, s = divmod(int(elapsed), 60)
+                self.txt_status.set_text(f"● REC  {m:02d}:{s:02d}")
+                self.txt_status.set_color("#ff4444")
+            else:
+                self.txt_status.set_text("● LIVE")
+                self.txt_status.set_color("#00ff88")
+
+        # Next inference countdown
+        secs = max(0, int(self._next_inf - time.time()))
+        self.txt_next.set_text(f"next AI check in {secs}s")
+
+        # AI result
+        result = self.inference.get_result()
+        if result:
+            prob  = result["probability"]
+            alert = result["alert"]
+            if alert:
+                self.txt_ai.set_text(f"⚠ MI ALERT — {prob:.1%} probability")
+                self.txt_ai.set_color("#ff4444")
+            else:
+                self.txt_ai.set_text(f"AI: Normal — {prob:.1%}")
+                self.txt_ai.set_color("#00ff88")
+            self._next_inf = time.time() + INFERENCE_EVERY
+
+        return self.lines + [self.txt_status, self.txt_lo,
+                              self.txt_ai, self.txt_next,
+                              self.txt_rec, self.txt_saved]
 
     def run(self):
-        self.win.show()
-        sys.exit(self.app.exec_())
+        interval_ms = 1000 // DISPLAY_FPS
+        self._anim = animation.FuncAnimation(
+            self.fig, self._animate,
+            interval=interval_ms, blit=True, cache_frame_data=False)
+        plt.show()
 
 
 # =============================================================================
 #  PHONE BROWSER DASHBOARD
-#  Served as a static HTML page over a simple HTTP server on port 8766
 # =============================================================================
 
 PHONE_HTML = """<!DOCTYPE html>
@@ -677,8 +594,8 @@ PHONE_HTML = """<!DOCTYPE html>
        display:flex;flex-direction:column;align-items:center;padding:20px;}
   h2{color:#00ff88;margin:0 0 16px;}
   #status{font-size:14px;color:#888;margin-bottom:20px;}
-  #prob-box{width:90%;max-width:400px;background:#111;border-radius:8px;padding:20px;
-            text-align:center;border:1px solid #334;}
+  #prob-box{width:90%;max-width:400px;background:#111;border-radius:8px;
+            padding:20px;text-align:center;border:1px solid #334;}
   #prob-num{font-size:48px;font-weight:bold;color:#00ff88;margin:10px 0;}
   #prob-bar-wrap{background:#1a1a1a;border-radius:4px;height:16px;margin:10px 0;}
   #prob-bar{height:16px;border-radius:4px;background:#00ff88;width:0%;
@@ -686,10 +603,9 @@ PHONE_HTML = """<!DOCTYPE html>
   #message{margin-top:16px;font-size:14px;color:#aaa;min-height:40px;}
   #alert-box{display:none;margin-top:20px;padding:16px;border-radius:8px;
              background:#3a0000;border:2px solid #ff4444;
-             color:#ff4444;font-size:16px;font-weight:bold;text-align:center;
-             width:90%;max-width:400px;}
+             color:#ff4444;font-size:16px;font-weight:bold;
+             text-align:center;width:90%;max-width:400px;}
   #ts{margin-top:12px;font-size:11px;color:#555;}
-  #threshold{font-size:12px;color:#666;margin-top:8px;}
 </style>
 </head>
 <body>
@@ -699,16 +615,13 @@ PHONE_HTML = """<!DOCTYPE html>
   <div>MI Probability</div>
   <div id="prob-num">--%</div>
   <div id="prob-bar-wrap"><div id="prob-bar"></div></div>
-  <div id="threshold"></div>
   <div id="message">Waiting for first inference window...</div>
   <div id="ts"></div>
 </div>
 <div id="alert-box">MI SUSPECTED — Seek medical attention immediately</div>
-
 <script>
 const WS_URL = `ws://${location.hostname}:8765`;
 let ws;
-
 function connect() {
   ws = new WebSocket(WS_URL);
   ws.onopen  = () => document.getElementById('status').textContent = 'Connected';
@@ -717,27 +630,15 @@ function connect() {
   ws.onerror = () => ws.close();
   ws.onmessage = e => {
     const d = JSON.parse(e.data);
-    if (d.type === 'init') {
-      document.getElementById('threshold').textContent =
-        `Alert threshold: ${(d.threshold*100).toFixed(1)}%`;
-    }
     if (d.type === 'inference') {
       const pct = Math.round(d.probability * 100);
       document.getElementById('prob-num').textContent  = pct + '%';
       document.getElementById('prob-bar').style.width  = pct + '%';
-      document.getElementById('prob-bar').style.background =
-        d.alert ? '#ff4444' : '#00ff88';
-      document.getElementById('prob-num').style.color =
-        d.alert ? '#ff4444' : '#00ff88';
+      document.getElementById('prob-bar').style.background = d.alert ? '#ff4444' : '#00ff88';
+      document.getElementById('prob-num').style.color  = d.alert ? '#ff4444' : '#00ff88';
       document.getElementById('message').textContent   = d.message;
-      document.getElementById('ts').textContent        =
-        'Last update: ' + new Date(d.timestamp).toLocaleTimeString();
-      document.getElementById('alert-box').style.display =
-        d.alert ? 'block' : 'none';
-      if (d.alert) {
-        try { new Audio('data:audio/wav;base64,UklGRl9vT19XQVZFZm10IBAAAA').play(); }
-        catch(e) {}
-      }
+      document.getElementById('ts').textContent = 'Last: ' + new Date(d.timestamp).toLocaleTimeString();
+      document.getElementById('alert-box').style.display = d.alert ? 'block' : 'none';
     }
   };
 }
@@ -748,9 +649,7 @@ connect();
 
 
 def serve_phone_dashboard():
-    """Serve the phone HTML dashboard on port 8766."""
     from http.server import HTTPServer, BaseHTTPRequestHandler
-
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             self.send_response(200)
@@ -758,8 +657,7 @@ def serve_phone_dashboard():
             self.end_headers()
             self.wfile.write(PHONE_HTML.encode())
         def log_message(self, *args):
-            pass  # silence HTTP logs
-
+            pass
     server = HTTPServer(("0.0.0.0", 8766), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     print("[HTTP] Phone dashboard on port 8766")
@@ -776,42 +674,34 @@ def main():
     print(f"  Inference every: {INFERENCE_EVERY}s")
     print(f"  Alert threshold: {ALERT_THRESHOLD}")
     print(f"  Recordings     : {RECORDINGS_DIR}")
+    print("  Controls       : R = record/stop   Q = quit")
     print("=" * 60)
 
-    # Hardware
     if HARDWARE_AVAILABLE:
         try:
             hw = ECGHardware()
         except Exception as e:
-            print(f"[WARN] Hardware init failed ({e}) — switching to mock")
+            print(f"[WARN] Hardware init failed ({e}) — mock mode")
             hw = MockHardware()
     else:
         hw = MockHardware()
 
-    # AI model
     try:
         predictor = MIPredictor()
     except FileNotFoundError as e:
         print(f"[ERROR] {e}")
         sys.exit(1)
 
-    # WebSocket server
     ws = WSServer()
-    ws.start()
-
-    # Phone dashboard HTTP server
     serve_phone_dashboard()
     print(f"[INFO] Open on phone: http://<pi-ip>:8766")
 
-    # Acquisition thread
     acq = AcquisitionThread(hw)
     acq.start()
 
-    # Inference thread
     inf = InferenceThread(acq, predictor, ws)
     inf.start()
 
-    # Display (blocks until quit)
     try:
         display = ECGDisplay(acq, inf, ws)
         display.run()
