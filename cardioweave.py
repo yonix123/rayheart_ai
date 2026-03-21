@@ -203,7 +203,7 @@ class ECGHardware:
             return None, True
        baseline = 0.55
        return ((self.ch0.voltage - baseline) * 1000.0,
-       (self.ch1.voltage - baseline) * 1000.0), False
+              (self.ch1.voltage - baseline) * 1000.0), False
 
     def cleanup(self):
         GPIO.cleanup()
