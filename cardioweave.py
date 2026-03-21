@@ -2,34 +2,10 @@
 """
 CardioWeave — Unified ECG Recorder + MI Detection
 ==================================================
-Hardware : 2x AD8232 + ADS1115 + Raspberry Pi
-Leads    : V1-V4 (chip 1), V3-V5 (chip 2)
+Hardware : 1x AD8232 (CJMCU-8232) + ADS1115 + Raspberry Pi
+Leads    : V1-V4 (chip 1 on A2), chip 2 mirrored
 AI       : Random Forest MI detector, inference every 60s
 Alerts   : Matplotlib display + WebSocket to phone browser
-
-WIRING QUICK REFERENCE:
-  ADS1115 SDA  → GPIO2  (Pin 3)
-  ADS1115 SCL  → GPIO3  (Pin 5)
-  ADS1115 VDD  → 3.3V   (Pin 1)
-  ADS1115 GND  → GND    (Pin 6)
-  ADS1115 ADDR → GND    (sets address 0x48)
-  ADS1115 A0   → AD8232 chip 1 OUTPUT  (V1-V4)
-  ADS1115 A1   → AD8232 chip 2 OUTPUT  (V3-V5)
-  AD8232 LO+ chip1 → GPIO17 (Pin 11)
-  AD8232 LO- chip1 → GPIO27 (Pin 13)
-  AD8232 LO+ chip2 → GPIO22 (Pin 15)
-  AD8232 LO- chip2 → GPIO23 (Pin 16)
-
-INSTALL ON PI:
-  pip install adafruit-circuitpython-ads1x15 RPi.GPIO
-  pip install numpy scipy scikit-learn matplotlib
-  pip install websockets pyEDFlib
-
-RUN:
-  python cardioweave.py
-
-PHONE BROWSER:
-  Open http://<pi-ip-address>:8766 on any device on same WiFi
 """
 
 import sys, os, time, threading, asyncio, datetime, json, pickle
@@ -37,17 +13,14 @@ import numpy as np
 from collections import deque
 from scipy.signal import butter, sosfilt, sosfilt_zi, iirnotch
 
-# ── Display (matplotlib — works on Pi without Qt) ─────────────────────────
 import matplotlib
-matplotlib.use("TkAgg")          # works on Pi desktop; fall back to Agg if headless
+matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from matplotlib.gridspec import GridSpec
 
-# ── Storage ────────────────────────────────────────────────────────────────
 import pyedflib
 
-# ── Hardware (comment out when testing on Mac with mock mode) ──────────────
 try:
     import board, busio, RPi.GPIO as GPIO
     import adafruit_ads1x15.ads1115 as ADS
@@ -57,21 +30,20 @@ except ImportError:
     HARDWARE_AVAILABLE = False
     print("[WARN] Hardware libs not found — running in MOCK mode")
 
-# ── WebSocket ──────────────────────────────────────────────────────────────
 import websockets
 
 # =============================================================================
 #  CONFIGURATION
 # =============================================================================
 
-SAMPLE_RATE      = 500          # Hz
-DISPLAY_WINDOW   = 5            # seconds shown on screen
-DISPLAY_FPS      = 20           # screen refresh rate
-MAINS_HZ         = 50           # notch filter frequency
-INFERENCE_EVERY  = 60           # seconds between AI inference runs
-ALERT_THRESHOLD  = 0.55         # from threshold optimizer
-MODEL_DIR        = "./models/"  # same folder as this script
-WS_PORT          = 8765         # WebSocket port for phone browser
+SAMPLE_RATE      = 500
+DISPLAY_WINDOW   = 5
+DISPLAY_FPS      = 20
+MAINS_HZ         = 50
+INFERENCE_EVERY  = 60
+ALERT_THRESHOLD  = 0.55
+MODEL_DIR        = "./models/"
+WS_PORT          = 8765
 RECORDINGS_DIR   = os.path.expanduser("~/ecg_recordings")
 
 LO_PINS     = {"p1": 17, "n1": 27, "p2": 22, "n2": 23}
@@ -91,14 +63,10 @@ def make_filters(fs):
 
 
 # =============================================================================
-#  FEATURE EXTRACTION (must match training exactly)
+#  FEATURE EXTRACTION
 # =============================================================================
 
 def extract_features(chip1_sig, chip2_sig, fs=100):
-    """
-    Extract 36 features — hardcoded to 100 Hz to match training.
-    Input signals must already be resampled to 100 Hz before calling.
-    """
     features = []
     for sig in [chip1_sig, chip2_sig]:
         features.extend([
@@ -108,7 +76,7 @@ def extract_features(chip1_sig, chip2_sig, fs=100):
             np.mean(np.abs(sig - np.mean(sig))),
         ])
         fft_v  = np.abs(np.fft.rfft(sig))
-        freqs  = np.fft.rfftfreq(len(sig), d=1.0 / 100)   # hardcoded 100 Hz
+        freqs  = np.fft.rfftfreq(len(sig), d=1.0 / 100)
         qrs_b  = fft_v[(freqs >= 5)  & (freqs <= 40)]
         st_b   = fft_v[(freqs >= 0.5) & (freqs <= 5)]
         ns_b   = fft_v[freqs > 40]
@@ -116,9 +84,8 @@ def extract_features(chip1_sig, chip2_sig, fs=100):
             np.sum(qrs_b**2),
             np.sum(st_b**2),
             np.sum(ns_b**2),
-            np.argmax(fft_v),           # int, matches training
+            np.argmax(fft_v),
         ])
-        # ST segment: hardcoded 6 / 12 samples (60 / 120 ms at 100 Hz)
         pk = int(np.argmax(np.abs(sig)))
         ss = min(pk + 6,  len(sig) - 1)
         se = min(pk + 12, len(sig))
@@ -150,7 +117,7 @@ class MIPredictor:
             if f.startswith("mi_model_") and f.endswith(".pkl")
         ])
         if not files:
-            raise FileNotFoundError("No model found. Run cardioweave_train_complete.py first.")
+            raise FileNotFoundError("No model found.")
         ts = files[-1].replace("mi_model_", "").replace(".pkl", "")
         with open(os.path.join(MODEL_DIR, f"mi_model_{ts}.pkl"), "rb") as f:
             model = pickle.load(f)
@@ -165,7 +132,6 @@ class MIPredictor:
         from scipy.signal import resample as sp_resample
         c1 = np.array(chip1_buf, dtype=np.float64)
         c2 = np.array(chip2_buf, dtype=np.float64)
-        # Resample from acquisition rate to 100 Hz (training rate)
         target = int(len(c1) * 100 / SAMPLE_RATE)
         c1 = sp_resample(c1, target)
         c2 = sp_resample(c2, target)
@@ -189,28 +155,27 @@ class ECGHardware:
         self.i2c = busio.I2C(board.SCL, board.SDA)
         self.ads = ADS.ADS1115(self.i2c)
         self.ads.data_rate = 860
-        from adafruit_ads1x15.ads1115 import ADS1115
-        self.ch0 = AnalogIn(self.ads, 2)
-        self.ch1 = AnalogIn(self.ads, 3)
+        self.ads.gain = 16          # highest gain: ±0.256V — needed for ECG signal
+        self.ch0 = AnalogIn(self.ads, 2)   # A2 — chip 1
+        self.ch1 = AnalogIn(self.ads, 3)   # A3 — chip 2 (or mirror of chip 1)
         GPIO.setmode(GPIO.BCM)
         for pin in LO_PINS.values():
             GPIO.setup(pin, GPIO.IN)
-        print("[HW] ADS1115 ready")
+        print("[HW] ADS1115 ready (gain=16)")
 
     def read(self):
         lo = any(GPIO.input(p) for p in LO_PINS.values())
         if lo:
             return None, True
-       baseline = 0.55
-       return ((self.ch0.voltage - baseline) * 1000.0,
-              (self.ch1.voltage - baseline) * 1000.0), False
+        v1 = self.ch0.voltage * 1000.0   # convert to mV
+        v2 = self.ch1.voltage * 1000.0   # mirror chip1 if chip2 not connected
+        return (v1, v2), False
 
     def cleanup(self):
         GPIO.cleanup()
 
 
 class MockHardware:
-    """Fake hardware for testing — generates synthetic ECG."""
     def __init__(self):
         self._t = 0.0
         print("[MOCK] Using synthetic ECG data")
@@ -393,18 +358,18 @@ class WSServer:
 class InferenceThread(threading.Thread):
     def __init__(self, acq, predictor, ws):
         super().__init__(daemon=True)
-        self.acq       = acq
-        self.predictor = predictor
-        self.ws        = ws
-        self.running   = False
+        self.acq         = acq
+        self.predictor   = predictor
+        self.ws          = ws
+        self.running     = False
         self.last_result = None
-        self.lock      = threading.Lock()
+        self.lock        = threading.Lock()
 
     def run(self):
         self.running = True
         while self.running:
             time.sleep(INFERENCE_EVERY)
-            c1, c2 = self.acq.get_inference_window()
+            c1, c2  = self.acq.get_inference_window()
             result  = self.predictor.predict(c1, c2)
             with self.lock:
                 self.last_result = result
@@ -426,16 +391,17 @@ class InferenceThread(threading.Thread):
 
 
 # =============================================================================
-#  DISPLAY  — matplotlib (no Qt dependency)
+#  DISPLAY
 # =============================================================================
 
 class ECGDisplay:
     def __init__(self, acq, inference, ws):
-        self.acq       = acq
-        self.inference = inference
-        self.ws        = ws
+        self.acq          = acq
+        self.inference    = inference
+        self.ws           = ws
         self.is_recording = False
-        self._next_inf = time.time() + INFERENCE_EVERY
+        self._next_inf    = time.time() + INFERENCE_EVERY
+        self._rec_wall    = 0.0
 
         plt.style.use("dark_background")
         self.fig = plt.figure(figsize=(13, 7), facecolor="#0a0e0e")
@@ -447,9 +413,8 @@ class ECGDisplay:
                       top=0.92, bottom=0.08, left=0.08, right=0.97)
 
         n = DISPLAY_WINDOW * SAMPLE_RATE
-        x = np.arange(n) / SAMPLE_RATE   # time axis in seconds
+        x = np.arange(n) / SAMPLE_RATE
 
-        # ── Lead plots ────────────────────────────────────────────────────
         self.axes  = []
         self.lines = []
         colors = ["#00ff88", "#00ccff"]
@@ -457,7 +422,7 @@ class ECGDisplay:
             ax = self.fig.add_subplot(gs[i])
             ax.set_facecolor("#0a0e0e")
             ax.set_xlim(0, DISPLAY_WINDOW)
-            ax.set_ylim(-2.5, 2.5)
+            ax.set_ylim(-10, 10)          # ±10 mV range for real ECG with gain 16
             ax.set_ylabel(LEAD_NAMES[i], color=colors[i], fontsize=9)
             ax.tick_params(colors="#445555", labelsize=7)
             ax.grid(True, color="#1a2a2a", linewidth=0.5)
@@ -469,39 +434,30 @@ class ECGDisplay:
             self.axes.append(ax)
             self.lines.append(line)
 
-        # ── Status panel ─────────────────────────────────────────────────
         ax_info = self.fig.add_subplot(gs[2])
         ax_info.set_facecolor("#0a0e0e")
         ax_info.axis("off")
 
-        self.txt_status = ax_info.text(
-            0.01, 0.75, "● LIVE", color="#00ff88",
-            fontsize=12, fontweight="bold", transform=ax_info.transAxes)
-        self.txt_lo = ax_info.text(
-            0.20, 0.75, "", color="#ff4444",
-            fontsize=11, fontweight="bold", transform=ax_info.transAxes)
-        self.txt_ai = ax_info.text(
-            0.01, 0.35, "AI: waiting for first window...",
-            color="#888888", fontsize=11, transform=ax_info.transAxes)
-        self.txt_next = ax_info.text(
-            0.01, 0.05, "", color="#555555",
-            fontsize=9, transform=ax_info.transAxes)
-        self.txt_rec = ax_info.text(
-            0.70, 0.75, "", color="#ff4444",
-            fontsize=10, fontweight="bold", transform=ax_info.transAxes)
-        self.txt_saved = ax_info.text(
-            0.70, 0.35, "", color="#556666",
-            fontsize=9, transform=ax_info.transAxes)
+        self.txt_status = ax_info.text(0.01, 0.75, "● LIVE", color="#00ff88",
+                                        fontsize=12, fontweight="bold",
+                                        transform=ax_info.transAxes)
+        self.txt_lo     = ax_info.text(0.20, 0.75, "", color="#ff4444",
+                                        fontsize=11, fontweight="bold",
+                                        transform=ax_info.transAxes)
+        self.txt_ai     = ax_info.text(0.01, 0.35, "AI: waiting for first window...",
+                                        color="#888888", fontsize=11,
+                                        transform=ax_info.transAxes)
+        self.txt_next   = ax_info.text(0.01, 0.05, "", color="#555555",
+                                        fontsize=9, transform=ax_info.transAxes)
+        self.txt_rec    = ax_info.text(0.70, 0.75, "", color="#ff4444",
+                                        fontsize=10, fontweight="bold",
+                                        transform=ax_info.transAxes)
+        self.txt_saved  = ax_info.text(0.70, 0.35, "", color="#556666",
+                                        fontsize=9, transform=ax_info.transAxes)
 
-        # Key bindings
         self.fig.canvas.mpl_connect("key_press_event", self._on_key)
-
-        # Instructions
-        self.fig.text(0.5, 0.01,
-                      "Press  R = start/stop recording   Q = quit",
+        self.fig.text(0.5, 0.01, "Press  R = start/stop recording   Q = quit",
                       ha="center", color="#445555", fontsize=9)
-
-        # Title
         self.fig.suptitle("CardioWeave — ECG Monitor",
                           color="#00ff88", fontsize=13, fontweight="bold")
 
@@ -536,7 +492,6 @@ class ECGDisplay:
         self.lines[0].set_ydata(c1)
         self.lines[1].set_ydata(c2)
 
-        # Lead-off
         if self.acq.lo_flag:
             self.txt_lo.set_text("⚠  ELECTRODE OFF")
             self.txt_status.set_text("● LEAD OFF")
@@ -552,11 +507,9 @@ class ECGDisplay:
                 self.txt_status.set_text("● LIVE")
                 self.txt_status.set_color("#00ff88")
 
-        # Next inference countdown
         secs = max(0, int(self._next_inf - time.time()))
         self.txt_next.set_text(f"next AI check in {secs}s")
 
-        # AI result
         result = self.inference.get_result()
         if result:
             prob  = result["probability"]
