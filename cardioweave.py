@@ -190,8 +190,8 @@ class ECGHardware:
         self.ads = ADS.ADS1115(self.i2c)
         self.ads.data_rate = 860
         self.ads.gain = ADS.Gain.ONE
-        self.ch0 = AnalogIn(self.ads, ADS.P0)
-        self.ch1 = AnalogIn(self.ads, ADS.P1)
+        self.ch0 = AnalogIn(self.ads, ADS.P2)
+        self.ch1 = AnalogIn(self.ads, ADS.P3)
         GPIO.setmode(GPIO.BCM)
         for pin in LO_PINS.values():
             GPIO.setup(pin, GPIO.IN)
