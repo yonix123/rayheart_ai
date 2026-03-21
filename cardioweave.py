@@ -189,8 +189,9 @@ class ECGHardware:
         self.i2c = busio.I2C(board.SCL, board.SDA)
         self.ads = ADS.ADS1115(self.i2c)
         self.ads.data_rate = 860
-        self.ch0 = AnalogIn(self.ads, ADS.P2)
-        self.ch1 = AnalogIn(self.ads, ADS.P3)
+        from adafruit_ads1x15.ads1115 import ADS1115
+        self.ch0 = AnalogIn(self.ads, 2)
+        self.ch1 = AnalogIn(self.ads, 3)
         GPIO.setmode(GPIO.BCM)
         for pin in LO_PINS.values():
             GPIO.setup(pin, GPIO.IN)
