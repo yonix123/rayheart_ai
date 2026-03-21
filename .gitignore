@@ -1,0 +1,13 @@
+records100/
+records500/
+ptbxl_database.csv
+scp_statements.csv
+ptbl_v102_changelog.txt
+ptbl_v103_changelog.txt
+SHA256SUMS.txt
+RECORDS
+LICENSE.txt
+ecg_recordings/
+__pycache__/
+*.pyc
+.DS_Store
