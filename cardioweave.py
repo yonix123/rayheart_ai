@@ -201,8 +201,9 @@ class ECGHardware:
         lo = any(GPIO.input(p) for p in LO_PINS.values())
         if lo:
             return None, True
-        return (self.ch0.voltage * 1000.0,
-                self.ch1.voltage * 1000.0), False
+       baseline = 0.55
+       return ((self.ch0.voltage - baseline) * 1000.0,
+       (self.ch1.voltage - baseline) * 1000.0), False
 
     def cleanup(self):
         GPIO.cleanup()
