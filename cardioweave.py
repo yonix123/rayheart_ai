@@ -155,7 +155,7 @@ class ECGHardware:
         self.i2c = busio.I2C(board.SCL, board.SDA)
         self.ads = ADS.ADS1115(self.i2c)
         self.ads.data_rate = 860
-        self.ads.gain =           # highest gain: ±0.256V — needed for ECG signal
+        self.ads.gain = 1          # highest gain: ±0.256V — needed for ECG signal
         self.ch0 = AnalogIn(self.ads, 2)   # A2 — chip 1
         self.ch1 = AnalogIn(self.ads, 3)   # A3 — chip 2 (or mirror of chip 1)
         GPIO.setmode(GPIO.BCM)
