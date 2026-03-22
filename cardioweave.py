@@ -155,7 +155,7 @@ class ECGHardware:
         self.i2c = busio.I2C(board.SCL, board.SDA)
         self.ads = ADS.ADS1115(self.i2c)
         self.ads.data_rate = 860
-        self.ads.gain = 16          # highest gain: ±0.256V — needed for ECG signal
+        self.ads.gain =           # highest gain: ±0.256V — needed for ECG signal
         self.ch0 = AnalogIn(self.ads, 2)   # A2 — chip 1
         self.ch1 = AnalogIn(self.ads, 3)   # A3 — chip 2 (or mirror of chip 1)
         GPIO.setmode(GPIO.BCM)
@@ -243,6 +243,8 @@ class AcquisitionThread(threading.Thread):
             time.sleep(max(0, self._interval - elapsed))
 
     def _process(self, v1, v2):
+        v1 = v1 - 550.0   # remove ~0.55V DC offset (in mV: 550mV)
+        v2 = v2 - 500.0   # remove ~0.50V DC offset
         s1, self.zi_bp[0] = sosfilt(self.sos_bp, [v1], zi=self.zi_bp[0])
         s1, self.zi_n[0]  = sosfilt(self.sos_n,  s1,   zi=self.zi_n[0])
         s2, self.zi_bp[1] = sosfilt(self.sos_bp, [v2], zi=self.zi_bp[1])
@@ -422,7 +424,7 @@ class ECGDisplay:
             ax = self.fig.add_subplot(gs[i])
             ax.set_facecolor("#0a0e0e")
             ax.set_xlim(0, DISPLAY_WINDOW)
-            ax.set_ylim(-10, 10)          # ±10 mV range for real ECG with gain 16
+            ax.set_ylim(-50, 50)          # ±10 mV range for real ECG with gain 16
             ax.set_ylabel(LEAD_NAMES[i], color=colors[i], fontsize=9)
             ax.tick_params(colors="#445555", labelsize=7)
             ax.grid(True, color="#1a2a2a", linewidth=0.5)
