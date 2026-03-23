@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-CardioWeave — Unified ECG Recorder + MI Detection
-==================================================
-Hardware : 1x AD8232 (CJMCU-8232) + ADS1115 + Raspberry Pi
-Leads    : V1-V4 (chip 1 on A2), chip 2 mirrored
-AI       : Random Forest MI detector, inference every 60s
-Alerts   : Matplotlib display + WebSocket to phone browser
+CardioWeave — ECG + SpO2 + Heart Rate
+======================================
+Hardware : 2x AD8232 + ADS1115 + MAX30102 + Raspberry Pi
+Displays : ECG waveform, HR, SpO2, MI probability
+Alerts   : Matplotlib + WebSocket to phone browser
+
+INSTALL:
+  pip install adafruit-circuitpython-ads1x15 RPi.GPIO
+  pip install numpy scipy scikit-learn smbus2
+  pip install matplotlib websockets pyedflib
 """
 
 import sys, os, time, threading, asyncio, datetime, json, pickle
@@ -25,6 +29,7 @@ try:
     import board, busio, RPi.GPIO as GPIO
     import adafruit_ads1x15.ads1115 as ADS
     from adafruit_ads1x15.analog_in import AnalogIn
+    import smbus2
     HARDWARE_AVAILABLE = True
 except ImportError:
     HARDWARE_AVAILABLE = False
@@ -36,19 +41,29 @@ import websockets
 #  CONFIGURATION
 # =============================================================================
 
-SAMPLE_RATE      = 500
-DISPLAY_WINDOW   = 5
-DISPLAY_FPS      = 20
-MAINS_HZ         = 50
-INFERENCE_EVERY  = 60
-ALERT_THRESHOLD  = 0.55
-MODEL_DIR        = "./models/"
-WS_PORT          = 8765
-RECORDINGS_DIR   = os.path.expanduser("~/ecg_recordings")
+SAMPLE_RATE     = 500
+DISPLAY_WINDOW  = 5
+DISPLAY_FPS     = 20
+MAINS_HZ        = 50
+INFERENCE_EVERY = 60
+ALERT_THRESHOLD = 0.55
+MODEL_DIR       = "./models/"
+WS_PORT         = 8765
+RECORDINGS_DIR  = os.path.expanduser("~/ecg_recordings")
 
 LO_PINS     = {"p1": 17, "n1": 27, "p2": 22, "n2": 23}
 LEAD_NAMES  = ["chip1 (V1-V4)", "chip2 (V3-V5)"]
 LEAD_COLORS = ["#00ff88", "#00ccff"]
+
+MAX30102_ADDR     = 0x57
+REG_INTR_ENABLE_1 = 0x02
+REG_FIFO_WR_PTR   = 0x04
+REG_FIFO_RD_PTR   = 0x06
+REG_FIFO_DATA     = 0x07
+REG_MODE_CONFIG   = 0x09
+REG_SPO2_CONFIG   = 0x0A
+REG_LED1_PA       = 0x0C
+REG_LED2_PA       = 0x0D
 
 
 # =============================================================================
@@ -75,15 +90,13 @@ def extract_features(chip1_sig, chip2_sig, fs=100):
             np.max(sig) - np.min(sig),
             np.mean(np.abs(sig - np.mean(sig))),
         ])
-        fft_v  = np.abs(np.fft.rfft(sig))
-        freqs  = np.fft.rfftfreq(len(sig), d=1.0 / 100)
-        qrs_b  = fft_v[(freqs >= 5)  & (freqs <= 40)]
-        st_b   = fft_v[(freqs >= 0.5) & (freqs <= 5)]
-        ns_b   = fft_v[freqs > 40]
+        fft_v = np.abs(np.fft.rfft(sig))
+        freqs = np.fft.rfftfreq(len(sig), d=1.0 / 100)
+        qrs_b = fft_v[(freqs >= 5)  & (freqs <= 40)]
+        st_b  = fft_v[(freqs >= 0.5) & (freqs <= 5)]
+        ns_b  = fft_v[freqs > 40]
         features.extend([
-            np.sum(qrs_b**2),
-            np.sum(st_b**2),
-            np.sum(ns_b**2),
+            np.sum(qrs_b**2), np.sum(st_b**2), np.sum(ns_b**2),
             np.argmax(fft_v),
         ])
         pk = int(np.argmax(np.abs(sig)))
@@ -132,16 +145,112 @@ class MIPredictor:
         from scipy.signal import resample as sp_resample
         c1 = np.array(chip1_buf, dtype=np.float64)
         c2 = np.array(chip2_buf, dtype=np.float64)
-        target = int(len(c1) * 100 / SAMPLE_RATE)
-        c1 = sp_resample(c1, target)
-        c2 = sp_resample(c2, target)
+        target       = int(len(c1) * 100 / SAMPLE_RATE)
+        c1           = sp_resample(c1, target)
+        c2           = sp_resample(c2, target)
         feats        = extract_features(c1, c2).reshape(1, -1)
         feats_scaled = self.scaler.transform(feats)
-        prob  = float(self.model.predict_proba(feats_scaled)[0, 1])
-        alert = prob >= ALERT_THRESHOLD
-        msg   = (f"MI SUSPECTED — {prob:.1%} — seek help immediately"
-                 if alert else f"Normal — {prob:.1%}")
+        prob         = float(self.model.predict_proba(feats_scaled)[0, 1])
+        alert        = prob >= ALERT_THRESHOLD
+        msg          = (f"MI SUSPECTED — {prob:.1%} — seek help immediately"
+                        if alert else f"Normal — {prob:.1%}")
         return {"probability": prob, "alert": alert, "message": msg}
+
+
+# =============================================================================
+#  MAX30102 DRIVER
+# =============================================================================
+
+class MAX30102:
+    def __init__(self, bus_num=1):
+        self.bus = smbus2.SMBus(bus_num)
+        self._init_sensor()
+        self._ir_buf  = deque(maxlen=200)
+        self._red_buf = deque(maxlen=200)
+        self.hr   = 0
+        self.spo2 = 0
+        print("[MAX] MAX30102 initialized")
+
+    def _write(self, reg, val):
+        self.bus.write_byte_data(MAX30102_ADDR, reg, val)
+
+    def _init_sensor(self):
+        self._write(REG_MODE_CONFIG,   0x40)
+        time.sleep(0.1)
+        self._write(REG_INTR_ENABLE_1, 0xC0)
+        self._write(REG_FIFO_WR_PTR,   0x00)
+        self._write(REG_FIFO_RD_PTR,   0x00)
+        self._write(REG_MODE_CONFIG,   0x03)
+        self._write(REG_SPO2_CONFIG,   0x27)
+        self._write(REG_LED1_PA,       0x24)
+        self._write(REG_LED2_PA,       0x24)
+
+    def read_fifo(self):
+        try:
+            raw = self.bus.read_i2c_block_data(MAX30102_ADDR, REG_FIFO_DATA, 6)
+            red = (raw[0] << 16 | raw[1] << 8 | raw[2]) & 0x3FFFF
+            ir  = (raw[3] << 16 | raw[4] << 8 | raw[5]) & 0x3FFFF
+            return red, ir
+        except Exception:
+            return None
+
+    def update(self):
+        sample = self.read_fifo()
+        if sample is None:
+            return
+        red, ir = sample
+        self._ir_buf.append(ir)
+        self._red_buf.append(red)
+        if len(self._ir_buf) < 100:
+            return
+        ir_arr  = np.array(self._ir_buf,  dtype=np.float64)
+        red_arr = np.array(self._red_buf, dtype=np.float64)
+        ir_norm = ir_arr - np.mean(ir_arr)
+        peaks   = self._find_peaks(ir_norm)
+        if len(peaks) >= 2:
+            avg_interval = np.mean(np.diff(peaks))
+            bpm = int(60.0 / (avg_interval / 100.0))
+            self.hr = max(30, min(250, bpm))
+        ir_ac  = np.std(ir_arr)
+        red_ac = np.std(red_arr)
+        ir_dc  = np.mean(ir_arr)
+        red_dc = np.mean(red_arr)
+        if ir_ac > 0 and ir_dc > 0 and red_dc > 0:
+            R = (red_ac / red_dc) / (ir_ac / ir_dc)
+            spo2 = 110.0 - 25.0 * R
+            self.spo2 = int(max(80, min(100, spo2)))
+
+    def _find_peaks(self, sig, min_distance=30):
+        peaks = []
+        for i in range(1, len(sig) - 1):
+            if (sig[i] > sig[i-1] and sig[i] > sig[i+1]
+                    and sig[i] > 0.3 * np.max(sig)):
+                if not peaks or (i - peaks[-1]) >= min_distance:
+                    peaks.append(i)
+        return peaks
+
+    def cleanup(self):
+        try:
+            self._write(REG_MODE_CONFIG, 0x80)
+            self.bus.close()
+        except Exception:
+            pass
+
+
+class MockMAX30102:
+    def __init__(self):
+        self._t   = 0.0
+        self.hr   = 72
+        self.spo2 = 98
+        print("[MOCK] Using synthetic HR/SpO2 data")
+
+    def update(self):
+        self._t  += 0.1
+        self.hr   = int(72 + 3 * np.sin(self._t * 0.1))
+        self.spo2 = int(max(95, min(100, 98 + np.random.randint(-1, 2))))
+
+    def cleanup(self):
+        pass
 
 
 # =============================================================================
@@ -155,20 +264,20 @@ class ECGHardware:
         self.i2c = busio.I2C(board.SCL, board.SDA)
         self.ads = ADS.ADS1115(self.i2c)
         self.ads.data_rate = 860
-        self.ads.gain = 1          # highest gain: ±0.256V — needed for ECG signal
-        self.ch0 = AnalogIn(self.ads, 2)   # A2 — chip 1
-        self.ch1 = AnalogIn(self.ads, 3)   # A3 — chip 2 (or mirror of chip 1)
+        self.ads.gain = 1
+        self.ch0 = AnalogIn(self.ads, 2)
+        self.ch1 = AnalogIn(self.ads, 3)
         GPIO.setmode(GPIO.BCM)
         for pin in LO_PINS.values():
             GPIO.setup(pin, GPIO.IN)
-        print("[HW] ADS1115 ready (gain=16)")
+        print("[HW] ADS1115 ready")
 
     def read(self):
         lo = any(GPIO.input(p) for p in LO_PINS.values())
         if lo:
             return None, True
-        v1 = self.ch0.voltage * 1000.0   # convert to mV
-        v2 = self.ch1.voltage * 1000.0   # mirror chip1 if chip2 not connected
+        v1 = self.ch0.voltage * 1000.0
+        v2 = self.ch1.voltage * 1000.0
         return (v1, v2), False
 
     def cleanup(self):
@@ -190,6 +299,31 @@ class MockHardware:
 
     def cleanup(self):
         pass
+
+
+# =============================================================================
+#  MAX30102 THREAD
+# =============================================================================
+
+class MAX30102Thread(threading.Thread):
+    def __init__(self, sensor):
+        super().__init__(daemon=True)
+        self.sensor  = sensor
+        self.running = False
+        self.lock    = threading.Lock()
+
+    def run(self):
+        self.running = True
+        while self.running:
+            self.sensor.update()
+            time.sleep(0.01)
+
+    def get_vitals(self):
+        with self.lock:
+            return self.sensor.hr, self.sensor.spo2
+
+    def stop(self):
+        self.running = False
 
 
 # =============================================================================
@@ -243,8 +377,8 @@ class AcquisitionThread(threading.Thread):
             time.sleep(max(0, self._interval - elapsed))
 
     def _process(self, v1, v2):
-        v1 = v1 - 550.0   # remove ~0.55V DC offset (in mV: 550mV)
-        v2 = v2 - 500.0   # remove ~0.50V DC offset
+        v1 = v1 - 550.0
+        v2 = v2 - 500.0
         s1, self.zi_bp[0] = sosfilt(self.sos_bp, [v1], zi=self.zi_bp[0])
         s1, self.zi_n[0]  = sosfilt(self.sos_n,  s1,   zi=self.zi_n[0])
         s2, self.zi_bp[1] = sosfilt(self.sos_bp, [v2], zi=self.zi_bp[1])
@@ -358,11 +492,12 @@ class WSServer:
 # =============================================================================
 
 class InferenceThread(threading.Thread):
-    def __init__(self, acq, predictor, ws):
+    def __init__(self, acq, predictor, ws, max_thread):
         super().__init__(daemon=True)
         self.acq         = acq
         self.predictor   = predictor
         self.ws          = ws
+        self.max_thread  = max_thread
         self.running     = False
         self.last_result = None
         self.lock        = threading.Lock()
@@ -371,16 +506,19 @@ class InferenceThread(threading.Thread):
         self.running = True
         while self.running:
             time.sleep(INFERENCE_EVERY)
-            c1, c2  = self.acq.get_inference_window()
-            result  = self.predictor.predict(c1, c2)
+            c1, c2   = self.acq.get_inference_window()
+            result   = self.predictor.predict(c1, c2)
+            hr, spo2 = self.max_thread.get_vitals()
             with self.lock:
-                self.last_result = result
-            print(f"[AI] {result['message']}")
+                self.last_result = {**result, "hr": hr, "spo2": spo2}
+            print(f"[AI] {result['message']}  HR:{hr}bpm  SpO2:{spo2}%")
             self.ws.broadcast({
                 "type":        "inference",
                 "probability": round(result["probability"], 4),
                 "alert":       result["alert"],
                 "message":     result["message"],
+                "hr":          hr,
+                "spo2":        spo2,
                 "timestamp":   datetime.datetime.now().isoformat(),
             })
 
@@ -393,26 +531,55 @@ class InferenceThread(threading.Thread):
 
 
 # =============================================================================
+#  VITALS BROADCAST THREAD — sends HR/SpO2 to phone every 2 seconds
+# =============================================================================
+
+class VitalsBroadcastThread(threading.Thread):
+    def __init__(self, max_thread, ws):
+        super().__init__(daemon=True)
+        self.max_thread = max_thread
+        self.ws         = ws
+        self.running    = False
+
+    def run(self):
+        self.running = True
+        while self.running:
+            time.sleep(2)
+            hr, spo2 = self.max_thread.get_vitals()
+            self.ws.broadcast({
+                "type":      "vitals",
+                "hr":        hr,
+                "spo2":      spo2,
+                "timestamp": datetime.datetime.now().isoformat(),
+            })
+
+    def stop(self):
+        self.running = False
+
+
+# =============================================================================
 #  DISPLAY
 # =============================================================================
 
 class ECGDisplay:
-    def __init__(self, acq, inference, ws):
+    def __init__(self, acq, inference, ws, max_thread):
         self.acq          = acq
         self.inference    = inference
         self.ws           = ws
+        self.max_thread   = max_thread
         self.is_recording = False
         self._next_inf    = time.time() + INFERENCE_EVERY
         self._rec_wall    = 0.0
 
         plt.style.use("dark_background")
-        self.fig = plt.figure(figsize=(13, 7), facecolor="#0a0e0e")
-        self.fig.canvas.manager.set_window_title("CardioWeave — Live ECG")
+        self.fig = plt.figure(figsize=(13, 8), facecolor="#0a0e0e")
+        self.fig.canvas.manager.set_window_title("CardioWeave")
 
-        gs = GridSpec(3, 1, figure=self.fig,
-                      height_ratios=[2, 2, 1],
-                      hspace=0.35,
-                      top=0.92, bottom=0.08, left=0.08, right=0.97)
+        gs = GridSpec(4, 2, figure=self.fig,
+                      height_ratios=[2, 2, 1, 1],
+                      hspace=0.45, wspace=0.3,
+                      top=0.92, bottom=0.07,
+                      left=0.08, right=0.97)
 
         n = DISPLAY_WINDOW * SAMPLE_RATE
         x = np.arange(n) / SAMPLE_RATE
@@ -421,10 +588,10 @@ class ECGDisplay:
         self.lines = []
         colors = ["#00ff88", "#00ccff"]
         for i in range(2):
-            ax = self.fig.add_subplot(gs[i])
+            ax = self.fig.add_subplot(gs[i, :])
             ax.set_facecolor("#0a0e0e")
             ax.set_xlim(0, DISPLAY_WINDOW)
-            ax.set_ylim(-50, 50)          # ±10 mV range for real ECG with gain 16
+            ax.set_ylim(-50, 50)
             ax.set_ylabel(LEAD_NAMES[i], color=colors[i], fontsize=9)
             ax.tick_params(colors="#445555", labelsize=7)
             ax.grid(True, color="#1a2a2a", linewidth=0.5)
@@ -436,31 +603,53 @@ class ECGDisplay:
             self.axes.append(ax)
             self.lines.append(line)
 
-        ax_info = self.fig.add_subplot(gs[2])
+        # HR panel
+        ax_hr = self.fig.add_subplot(gs[2, 0])
+        ax_hr.set_facecolor("#0a0e0e")
+        ax_hr.axis("off")
+        self.txt_hr = ax_hr.text(0.5, 0.5, "HR\n--",
+                                  color="#ff6644", fontsize=22,
+                                  fontweight="bold", ha="center",
+                                  va="center", transform=ax_hr.transAxes)
+
+        # SpO2 panel
+        ax_spo2 = self.fig.add_subplot(gs[2, 1])
+        ax_spo2.set_facecolor("#0a0e0e")
+        ax_spo2.axis("off")
+        self.txt_spo2 = ax_spo2.text(0.5, 0.5, "SpO2\n--%",
+                                      color="#00aaff", fontsize=22,
+                                      fontweight="bold", ha="center",
+                                      va="center", transform=ax_spo2.transAxes)
+
+        # Status / AI panel
+        ax_info = self.fig.add_subplot(gs[3, :])
         ax_info.set_facecolor("#0a0e0e")
         ax_info.axis("off")
 
-        self.txt_status = ax_info.text(0.01, 0.75, "● LIVE", color="#00ff88",
-                                        fontsize=12, fontweight="bold",
+        self.txt_status = ax_info.text(0.01, 0.75, "● LIVE",
+                                        color="#00ff88", fontsize=12,
+                                        fontweight="bold",
                                         transform=ax_info.transAxes)
-        self.txt_lo     = ax_info.text(0.20, 0.75, "", color="#ff4444",
-                                        fontsize=11, fontweight="bold",
-                                        transform=ax_info.transAxes)
-        self.txt_ai     = ax_info.text(0.01, 0.35, "AI: waiting for first window...",
-                                        color="#888888", fontsize=11,
-                                        transform=ax_info.transAxes)
-        self.txt_next   = ax_info.text(0.01, 0.05, "", color="#555555",
-                                        fontsize=9, transform=ax_info.transAxes)
-        self.txt_rec    = ax_info.text(0.70, 0.75, "", color="#ff4444",
-                                        fontsize=10, fontweight="bold",
-                                        transform=ax_info.transAxes)
-        self.txt_saved  = ax_info.text(0.70, 0.35, "", color="#556666",
-                                        fontsize=9, transform=ax_info.transAxes)
+        self.txt_lo = ax_info.text(0.18, 0.75, "", color="#ff4444",
+                                    fontsize=11, fontweight="bold",
+                                    transform=ax_info.transAxes)
+        self.txt_ai = ax_info.text(0.01, 0.20,
+                                    "AI: waiting for first window...",
+                                    color="#888888", fontsize=11,
+                                    transform=ax_info.transAxes)
+        self.txt_next  = ax_info.text(0.60, 0.20, "", color="#555555",
+                                       fontsize=9, transform=ax_info.transAxes)
+        self.txt_rec   = ax_info.text(0.75, 0.75, "", color="#ff4444",
+                                       fontsize=10, fontweight="bold",
+                                       transform=ax_info.transAxes)
+        self.txt_saved = ax_info.text(0.60, 0.50, "", color="#556666",
+                                       fontsize=9, transform=ax_info.transAxes)
 
         self.fig.canvas.mpl_connect("key_press_event", self._on_key)
-        self.fig.text(0.5, 0.01, "Press  R = start/stop recording   Q = quit",
+        self.fig.text(0.5, 0.01,
+                      "Press  R = start/stop recording   Q = quit",
                       ha="center", color="#445555", fontsize=9)
-        self.fig.suptitle("CardioWeave — ECG Monitor",
+        self.fig.suptitle("CardioWeave — ECG + SpO2 Monitor",
                           color="#00ff88", fontsize=13, fontweight="bold")
 
     def _on_key(self, event):
@@ -494,6 +683,11 @@ class ECGDisplay:
         self.lines[0].set_ydata(c1)
         self.lines[1].set_ydata(c2)
 
+        hr, spo2 = self.max_thread.get_vitals()
+        self.txt_hr.set_text(f"HR\n{hr} bpm")
+        self.txt_spo2.set_text(f"SpO2\n{spo2}%")
+        self.txt_spo2.set_color("#ff4444" if spo2 < 95 else "#00aaff")
+
         if self.acq.lo_flag:
             self.txt_lo.set_text("⚠  ELECTRODE OFF")
             self.txt_status.set_text("● LEAD OFF")
@@ -524,15 +718,15 @@ class ECGDisplay:
                 self.txt_ai.set_color("#00ff88")
             self._next_inf = time.time() + INFERENCE_EVERY
 
-        return self.lines + [self.txt_status, self.txt_lo,
-                              self.txt_ai, self.txt_next,
-                              self.txt_rec, self.txt_saved]
+        return self.lines + [self.txt_status, self.txt_lo, self.txt_ai,
+                              self.txt_next, self.txt_rec, self.txt_saved,
+                              self.txt_hr, self.txt_spo2]
 
     def run(self):
-        interval_ms = 1000 // DISPLAY_FPS
         self._anim = animation.FuncAnimation(
             self.fig, self._animate,
-            interval=interval_ms, blit=True, cache_frame_data=False)
+            interval=1000 // DISPLAY_FPS,
+            blit=True, cache_frame_data=False)
         plt.show()
 
 
@@ -546,32 +740,50 @@ PHONE_HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CardioWeave</title>
 <style>
+  *{box-sizing:border-box;}
   body{margin:0;background:#0a0e0e;color:#cce;font-family:monospace;
-       display:flex;flex-direction:column;align-items:center;padding:20px;}
-  h2{color:#00ff88;margin:0 0 16px;}
-  #status{font-size:14px;color:#888;margin-bottom:20px;}
-  #prob-box{width:90%;max-width:400px;background:#111;border-radius:8px;
-            padding:20px;text-align:center;border:1px solid #334;}
-  #prob-num{font-size:48px;font-weight:bold;color:#00ff88;margin:10px 0;}
-  #prob-bar-wrap{background:#1a1a1a;border-radius:4px;height:16px;margin:10px 0;}
-  #prob-bar{height:16px;border-radius:4px;background:#00ff88;width:0%;
+       display:flex;flex-direction:column;align-items:center;padding:16px;}
+  h2{color:#00ff88;margin:0 0 10px;font-size:20px;}
+  #status{font-size:12px;color:#888;margin-bottom:12px;}
+  .vitals-row{display:flex;gap:12px;width:100%;max-width:420px;margin-bottom:12px;}
+  .vital-box{flex:1;background:#111;border-radius:8px;padding:14px;
+             text-align:center;border:1px solid #334;}
+  .vital-label{font-size:11px;color:#888;margin-bottom:4px;}
+  .vital-value{font-size:32px;font-weight:bold;}
+  #hr-val{color:#ff6644;}
+  #spo2-val{color:#00aaff;}
+  #prob-box{width:100%;max-width:420px;background:#111;border-radius:8px;
+            padding:16px;text-align:center;border:1px solid #334;}
+  #prob-num{font-size:42px;font-weight:bold;color:#00ff88;margin:6px 0;}
+  #prob-bar-wrap{background:#1a1a1a;border-radius:4px;height:14px;margin:8px 0;}
+  #prob-bar{height:14px;border-radius:4px;background:#00ff88;width:0%;
             transition:width 0.5s,background 0.5s;}
-  #message{margin-top:16px;font-size:14px;color:#aaa;min-height:40px;}
-  #alert-box{display:none;margin-top:20px;padding:16px;border-radius:8px;
-             background:#3a0000;border:2px solid #ff4444;
-             color:#ff4444;font-size:16px;font-weight:bold;
-             text-align:center;width:90%;max-width:400px;}
-  #ts{margin-top:12px;font-size:11px;color:#555;}
+  #message{font-size:13px;color:#aaa;min-height:36px;margin-top:10px;}
+  #alert-box{display:none;margin-top:12px;padding:14px;border-radius:8px;
+             background:#3a0000;border:2px solid #ff4444;color:#ff4444;
+             font-size:15px;font-weight:bold;text-align:center;
+             width:100%;max-width:420px;}
+  #ts{margin-top:8px;font-size:10px;color:#555;}
 </style>
 </head>
 <body>
 <h2>CardioWeave</h2>
 <div id="status">Connecting...</div>
+<div class="vitals-row">
+  <div class="vital-box">
+    <div class="vital-label">Heart Rate</div>
+    <div class="vital-value" id="hr-val">--<span style="font-size:14px;"> bpm</span></div>
+  </div>
+  <div class="vital-box">
+    <div class="vital-label">SpO2</div>
+    <div class="vital-value" id="spo2-val">--<span style="font-size:14px;">%</span></div>
+  </div>
+</div>
 <div id="prob-box">
-  <div>MI Probability</div>
+  <div style="font-size:12px;color:#888;">MI Probability</div>
   <div id="prob-num">--%</div>
   <div id="prob-bar-wrap"><div id="prob-bar"></div></div>
-  <div id="message">Waiting for first inference window...</div>
+  <div id="message">Waiting for first AI window...</div>
   <div id="ts"></div>
 </div>
 <div id="alert-box">MI SUSPECTED — Seek medical attention immediately</div>
@@ -581,20 +793,34 @@ let ws;
 function connect() {
   ws = new WebSocket(WS_URL);
   ws.onopen  = () => document.getElementById('status').textContent = 'Connected';
-  ws.onclose = () => { document.getElementById('status').textContent = 'Reconnecting...';
-                        setTimeout(connect, 2000); };
+  ws.onclose = () => {
+    document.getElementById('status').textContent = 'Reconnecting...';
+    setTimeout(connect, 2000);
+  };
   ws.onerror = () => ws.close();
   ws.onmessage = e => {
     const d = JSON.parse(e.data);
+    if (d.type === 'vitals') {
+      document.getElementById('hr-val').innerHTML =
+        d.hr + '<span style="font-size:14px;"> bpm</span>';
+      const s = document.getElementById('spo2-val');
+      s.innerHTML = d.spo2 + '<span style="font-size:14px;">%</span>';
+      s.style.color = d.spo2 < 95 ? '#ff4444' : '#00aaff';
+    }
     if (d.type === 'inference') {
       const pct = Math.round(d.probability * 100);
-      document.getElementById('prob-num').textContent  = pct + '%';
-      document.getElementById('prob-bar').style.width  = pct + '%';
+      document.getElementById('prob-num').textContent = pct + '%';
+      document.getElementById('prob-bar').style.width = pct + '%';
       document.getElementById('prob-bar').style.background = d.alert ? '#ff4444' : '#00ff88';
-      document.getElementById('prob-num').style.color  = d.alert ? '#ff4444' : '#00ff88';
-      document.getElementById('message').textContent   = d.message;
-      document.getElementById('ts').textContent = 'Last: ' + new Date(d.timestamp).toLocaleTimeString();
+      document.getElementById('prob-num').style.color = d.alert ? '#ff4444' : '#00ff88';
+      document.getElementById('message').textContent = d.message;
+      document.getElementById('ts').textContent =
+        'Last AI check: ' + new Date(d.timestamp).toLocaleTimeString();
       document.getElementById('alert-box').style.display = d.alert ? 'block' : 'none';
+      if (d.hr) document.getElementById('hr-val').innerHTML =
+        d.hr + '<span style="font-size:14px;"> bpm</span>';
+      if (d.spo2) document.getElementById('spo2-val').innerHTML =
+        d.spo2 + '<span style="font-size:14px;">%</span>';
     }
   };
 }
@@ -625,7 +851,7 @@ def serve_phone_dashboard():
 
 def main():
     print("=" * 60)
-    print("  CardioWeave — ECG Recorder + MI Detection")
+    print("  CardioWeave — ECG + SpO2 + HR + MI Detection")
     print(f"  Sample rate    : {SAMPLE_RATE} SPS")
     print(f"  Inference every: {INFERENCE_EVERY}s")
     print(f"  Alert threshold: {ALERT_THRESHOLD}")
@@ -637,10 +863,19 @@ def main():
         try:
             hw = ECGHardware()
         except Exception as e:
-            print(f"[WARN] Hardware init failed ({e}) — mock mode")
+            print(f"[WARN] ECG hardware failed ({e}) — mock mode")
             hw = MockHardware()
     else:
         hw = MockHardware()
+
+    if HARDWARE_AVAILABLE:
+        try:
+            max_sensor = MAX30102()
+        except Exception as e:
+            print(f"[WARN] MAX30102 failed ({e}) — mock vitals")
+            max_sensor = MockMAX30102()
+    else:
+        max_sensor = MockMAX30102()
 
     try:
         predictor = MIPredictor()
@@ -650,23 +885,30 @@ def main():
 
     ws = WSServer()
     serve_phone_dashboard()
-    print(f"[INFO] Open on phone: http://<pi-ip>:8766")
+    print(f"[INFO] Phone dashboard: http://<pi-ip>:8766")
 
-    acq = AcquisitionThread(hw)
+    acq          = AcquisitionThread(hw)
+    max_thread   = MAX30102Thread(max_sensor)
+    vitals_bcast = VitalsBroadcastThread(max_thread, ws)
+    inf          = InferenceThread(acq, predictor, ws, max_thread)
+
     acq.start()
-
-    inf = InferenceThread(acq, predictor, ws)
+    max_thread.start()
+    vitals_bcast.start()
     inf.start()
 
     try:
-        display = ECGDisplay(acq, inf, ws)
+        display = ECGDisplay(acq, inf, ws, max_thread)
         display.run()
     except KeyboardInterrupt:
         print("\n[INFO] Interrupted")
     finally:
         acq.stop()
         inf.stop()
+        vitals_bcast.stop()
+        max_thread.stop()
         hw.cleanup()
+        max_sensor.cleanup()
         print("[INFO] Shutdown complete")
 
 
