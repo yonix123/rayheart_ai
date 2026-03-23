@@ -737,90 +737,296 @@ class ECGDisplay:
 PHONE_HTML = """<!DOCTYPE html>
 <html>
 <head>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CardioWeave</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>RayHeart</title>
 <style>
-  *{box-sizing:border-box;}
-  body{margin:0;background:#0a0e0e;color:#cce;font-family:monospace;
-       display:flex;flex-direction:column;align-items:center;padding:16px;}
-  h2{color:#00ff88;margin:0 0 10px;font-size:20px;}
-  #status{font-size:12px;color:#888;margin-bottom:12px;}
-  .vitals-row{display:flex;gap:12px;width:100%;max-width:420px;margin-bottom:12px;}
-  .vital-box{flex:1;background:#111;border-radius:8px;padding:14px;
-             text-align:center;border:1px solid #334;}
-  .vital-label{font-size:11px;color:#888;margin-bottom:4px;}
-  .vital-value{font-size:32px;font-weight:bold;}
-  #hr-val{color:#ff6644;}
-  #spo2-val{color:#00aaff;}
-  #prob-box{width:100%;max-width:420px;background:#111;border-radius:8px;
-            padding:16px;text-align:center;border:1px solid #334;}
-  #prob-num{font-size:42px;font-weight:bold;color:#00ff88;margin:6px 0;}
-  #prob-bar-wrap{background:#1a1a1a;border-radius:4px;height:14px;margin:8px 0;}
-  #prob-bar{height:14px;border-radius:4px;background:#00ff88;width:0%;
-            transition:width 0.5s,background 0.5s;}
-  #message{font-size:13px;color:#aaa;min-height:36px;margin-top:10px;}
-  #alert-box{display:none;margin-top:12px;padding:14px;border-radius:8px;
-             background:#3a0000;border:2px solid #ff4444;color:#ff4444;
-             font-size:15px;font-weight:bold;text-align:center;
-             width:100%;max-width:420px;}
-  #ts{margin-top:8px;font-size:10px;color:#555;}
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #ffffff;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    max-width: 430px;
+    margin: 0 auto;
+  }
+  .status-bar {
+    height: 44px;
+    background: #fff;
+    display: flex;
+    align-items: center;
+    padding: 0 20px;
+    justify-content: space-between;
+    font-size: 12px;
+    color: #333;
+    border-bottom: 0.5px solid #eee;
+  }
+  .header {
+    padding: 16px 20px 12px;
+    background: #fff;
+    border-bottom: 0.5px solid #f0f0f0;
+  }
+  .header h1 {
+    font-size: 26px;
+    font-weight: 700;
+    color: #F57C00;
+    letter-spacing: -0.5px;
+  }
+  .header p {
+    font-size: 13px;
+    color: #999;
+    margin-top: 2px;
+  }
+  .content {
+    flex: 1;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    background: #f7f7f7;
+  }
+  .card {
+    background: #fff;
+    border-radius: 16px;
+    padding: 18px;
+    border: 0.5px solid #ececec;
+  }
+  .card-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: #bbb;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    margin-bottom: 10px;
+  }
+  .status-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #4CAF50;
+  }
+  .dot.alert { background: #F44336; }
+  .status-text {
+    font-size: 15px;
+    font-weight: 500;
+    color: #222;
+  }
+  .prob-big {
+    font-size: 56px;
+    font-weight: 700;
+    color: #222;
+    line-height: 1;
+    margin: 8px 0 4px;
+  }
+  .prob-big.alert { color: #F44336; }
+  .prob-big.normal { color: #4CAF50; }
+  .prob-sub {
+    font-size: 13px;
+    color: #999;
+  }
+  .bar-wrap {
+    background: #f0f0f0;
+    border-radius: 8px;
+    height: 8px;
+    margin-top: 14px;
+    overflow: hidden;
+  }
+  .bar-fill {
+    height: 8px;
+    border-radius: 8px;
+    background: #4CAF50;
+    width: 0%;
+    transition: width 0.6s ease, background 0.4s;
+  }
+  .bar-fill.alert { background: #F44336; }
+  .message-box {
+    background: #fff8f0;
+    border: 1px solid #FFE0B2;
+    border-radius: 12px;
+    padding: 14px 16px;
+    display: none;
+  }
+  .message-box.visible { display: block; }
+  .message-box p {
+    font-size: 14px;
+    color: #E65100;
+    font-weight: 500;
+    line-height: 1.5;
+  }
+  .info-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 0;
+    border-bottom: 0.5px solid #f5f5f5;
+  }
+  .info-row:last-child { border-bottom: none; }
+  .info-label { font-size: 13px; color: #999; }
+  .info-val { font-size: 13px; font-weight: 500; color: #333; }
+  .conn-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 4px 10px;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 500;
+    background: #E8F5E9;
+    color: #2E7D32;
+  }
+  .conn-badge.disconnected {
+    background: #ffeee8;
+    color: #c0392b;
+  }
+  .footer {
+    padding: 16px 20px 32px;
+    background: #f7f7f7;
+    text-align: center;
+  }
+  .footer p {
+    font-size: 11px;
+    color: #ccc;
+  }
+  .footer span { color: #F57C00; font-weight: 600; }
 </style>
 </head>
 <body>
-<h2>CardioWeave</h2>
-<div id="status">Connecting...</div>
-<div class="vitals-row">
-  <div class="vital-box">
-    <div class="vital-label">Heart Rate</div>
-    <div class="vital-value" id="hr-val">--<span style="font-size:14px;"> bpm</span></div>
-  </div>
-  <div class="vital-box">
-    <div class="vital-label">SpO2</div>
-    <div class="vital-value" id="spo2-val">--<span style="font-size:14px;">%</span></div>
-  </div>
+
+<div class="status-bar">
+  <span id="clock">--:--</span>
+  <span>RayHeart</span>
+  <span>&#9679;</span>
 </div>
-<div id="prob-box">
-  <div style="font-size:12px;color:#888;">MI Probability</div>
-  <div id="prob-num">--%</div>
-  <div id="prob-bar-wrap"><div id="prob-bar"></div></div>
-  <div id="message">Waiting for first AI window...</div>
-  <div id="ts"></div>
+
+<div class="header">
+  <h1>RayHeart</h1>
+  <p>Live cardiac monitoring</p>
 </div>
-<div id="alert-box">MI SUSPECTED — Seek medical attention immediately</div>
+
+<div class="content">
+
+  <div class="card">
+    <div class="card-label">Connection</div>
+    <div class="status-row">
+      <div class="dot" id="conn-dot"></div>
+      <span class="status-text" id="conn-text">Connecting...</span>
+      <span class="conn-badge disconnected" id="conn-badge" style="margin-left:auto;">Offline</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-label">MI Probability</div>
+    <div class="prob-big" id="prob-num">--%</div>
+    <div class="prob-sub" id="prob-sub">Waiting for first reading...</div>
+    <div class="bar-wrap">
+      <div class="bar-fill" id="prob-bar"></div>
+    </div>
+  </div>
+
+  <div class="message-box" id="alert-box">
+    <p>MI SUSPECTED — Seek medical attention immediately.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-label">Details</div>
+    <div class="info-row">
+      <span class="info-label">Threshold</span>
+      <span class="info-val" id="threshold-val">--</span>
+    </div>
+    <div class="info-row">
+      <span class="info-label">Last update</span>
+      <span class="info-val" id="last-update">--</span>
+    </div>
+    <div class="info-row">
+      <span class="info-label">Status</span>
+      <span class="info-val" id="status-val">--</span>
+    </div>
+  </div>
+
+</div>
+
+<div class="footer">
+  <p>Powered by <span>RayHeart</span> &bull; CardioWeave AI</p>
+</div>
+
 <script>
-const WS_URL = `ws://${location.hostname}:8765`;
+function updateClock() {
+  const now = new Date();
+  document.getElementById("clock").textContent =
+    now.getHours().toString().padStart(2,"0") + ":" +
+    now.getMinutes().toString().padStart(2,"0");
+}
+updateClock();
+setInterval(updateClock, 10000);
+
+const WS_URL = "ws://" + location.hostname + ":8765";
 let ws;
+
+function setConnected(on) {
+  const dot = document.getElementById("conn-dot");
+  const text = document.getElementById("conn-text");
+  const badge = document.getElementById("conn-badge");
+  if (on) {
+    dot.className = "dot";
+    text.textContent = "Connected";
+    badge.className = "conn-badge";
+    badge.textContent = "Live";
+  } else {
+    dot.className = "dot alert";
+    text.textContent = "Disconnected";
+    badge.className = "conn-badge disconnected";
+    badge.textContent = "Offline";
+  }
+}
+
 function connect() {
   ws = new WebSocket(WS_URL);
-  ws.onopen  = () => document.getElementById('status').textContent = 'Connected';
-  ws.onclose = () => {
-    document.getElementById('status').textContent = 'Reconnecting...';
-    setTimeout(connect, 2000);
-  };
+  ws.onopen = () => setConnected(true);
+  ws.onclose = () => { setConnected(false); setTimeout(connect, 2000); };
   ws.onerror = () => ws.close();
   ws.onmessage = e => {
     const d = JSON.parse(e.data);
-    if (d.type === 'vitals') {
-      document.getElementById('hr-val').innerHTML =
-        d.hr + '<span style="font-size:14px;"> bpm</span>';
-      const s = document.getElementById('spo2-val');
-      s.innerHTML = d.spo2 + '<span style="font-size:14px;">%</span>';
-      s.style.color = d.spo2 < 95 ? '#ff4444' : '#00aaff';
+    if (d.type === "init") {
+      document.getElementById("threshold-val").textContent =
+        Math.round(d.threshold * 100) + "%";
     }
-    if (d.type === 'inference') {
+    if (d.type === "inference") {
       const pct = Math.round(d.probability * 100);
-      document.getElementById('prob-num').textContent = pct + '%';
-      document.getElementById('prob-bar').style.width = pct + '%';
-      document.getElementById('prob-bar').style.background = d.alert ? '#ff4444' : '#00ff88';
-      document.getElementById('prob-num').style.color = d.alert ? '#ff4444' : '#00ff88';
-      document.getElementById('message').textContent = d.message;
-      document.getElementById('ts').textContent =
-        'Last AI check: ' + new Date(d.timestamp).toLocaleTimeString();
-      document.getElementById('alert-box').style.display = d.alert ? 'block' : 'none';
-      if (d.hr) document.getElementById('hr-val').innerHTML =
-        d.hr + '<span style="font-size:14px;"> bpm</span>';
-      if (d.spo2) document.getElementById('spo2-val').innerHTML =
-        d.spo2 + '<span style="font-size:14px;">%</span>';
+      const probEl = document.getElementById("prob-num");
+      const barEl = document.getElementById("prob-bar");
+      const alertBox = document.getElementById("alert-box");
+      const subEl = document.getElementById("prob-sub");
+      const statusEl = document.getElementById("status-val");
+
+      probEl.textContent = pct + "%";
+      barEl.style.width = pct + "%";
+
+      if (d.alert) {
+        probEl.className = "prob-big alert";
+        barEl.className = "bar-fill alert";
+        alertBox.className = "message-box visible";
+        subEl.textContent = "Elevated risk detected";
+        statusEl.textContent = "ALERT";
+        statusEl.style.color = "#F44336";
+      } else {
+        probEl.className = "prob-big normal";
+        barEl.className = "bar-fill";
+        alertBox.className = "message-box";
+        subEl.textContent = d.message;
+        statusEl.textContent = "Normal";
+        statusEl.style.color = "#4CAF50";
+      }
+
+      const ts = new Date(d.timestamp);
+      document.getElementById("last-update").textContent =
+        ts.getHours().toString().padStart(2,"0") + ":" +
+        ts.getMinutes().toString().padStart(2,"0") + ":" +
+        ts.getSeconds().toString().padStart(2,"0");
     }
   };
 }
