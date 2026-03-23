@@ -791,6 +791,14 @@ PHONE_HTML = """<!DOCTYPE html>
     padding: 18px;
     border: 0.5px solid #ececec;
   }
+  .vitals-row {
+    display: flex;
+    gap: 14px;
+  }
+  .vital-card {
+    flex: 1;
+    text-align: center;
+  }
   .card-label {
     font-size: 11px;
     font-weight: 600;
@@ -798,6 +806,18 @@ PHONE_HTML = """<!DOCTYPE html>
     text-transform: uppercase;
     letter-spacing: 0.8px;
     margin-bottom: 10px;
+  }
+  .vital-value {
+    font-size: 32px;
+    font-weight: 700;
+    color: #222;
+    line-height: 1;
+  }
+  .vital-unit {
+    font-size: 12px;
+    color: #999;
+    font-weight: 600;
+    margin-top: 4px;
   }
   .status-row {
     display: flex;
@@ -899,7 +919,7 @@ PHONE_HTML = """<!DOCTYPE html>
 
 <div class="status-bar">
   <span id="clock">--:--</span>
-  <span>RayHeart</span>
+  <span>RayHeart Monitor</span>
   <span>&#9679;</span>
 </div>
 
@@ -916,6 +936,20 @@ PHONE_HTML = """<!DOCTYPE html>
       <div class="dot" id="conn-dot"></div>
       <span class="status-text" id="conn-text">Connecting...</span>
       <span class="conn-badge disconnected" id="conn-badge" style="margin-left:auto;">Offline</span>
+    </div>
+  </div>
+
+  <!-- NEW VITALS ROW -->
+  <div class="vitals-row">
+    <div class="card vital-card">
+      <div class="card-label">Heart Rate</div>
+      <div class="vital-value" id="hr-val">--</div>
+      <div class="vital-unit">BPM</div>
+    </div>
+    <div class="card vital-card">
+      <div class="card-label">SpO2</div>
+      <div class="vital-value" id="spo2-val">--</div>
+      <div class="vital-unit">%</div>
     </div>
   </div>
 
@@ -943,8 +977,8 @@ PHONE_HTML = """<!DOCTYPE html>
       <span class="info-val" id="last-update">--</span>
     </div>
     <div class="info-row">
-      <span class="info-label">Status</span>
-      <span class="info-val" id="status-val">--</span>
+      <span class="info-label">System Status</span>
+      <span class="info-val" id="status-val">Initializing</span>
     </div>
   </div>
 
@@ -991,10 +1025,25 @@ function connect() {
   ws.onerror = () => ws.close();
   ws.onmessage = e => {
     const d = JSON.parse(e.data);
+    
     if (d.type === "init") {
       document.getElementById("threshold-val").textContent =
         Math.round(d.threshold * 100) + "%";
     }
+
+    // HANDLE LIVE VITALS DATA (HR and SpO2)
+    if (d.type === "vitals" || d.type === "inference") {
+      if (d.hr !== undefined) {
+        document.getElementById("hr-val").textContent = d.hr > 0 ? d.hr : "--";
+      }
+      if (d.spo2 !== undefined) {
+        const spo2El = document.getElementById("spo2-val");
+        spo2El.textContent = d.spo2 > 0 ? d.spo2 : "--";
+        // Color SpO2 red if it drops below 95%
+        spo2El.style.color = (d.spo2 > 0 && d.spo2 < 95) ? "#F44336" : "#222";
+      }
+    }
+
     if (d.type === "inference") {
       const pct = Math.round(d.probability * 100);
       const probEl = document.getElementById("prob-num");
@@ -1034,7 +1083,6 @@ connect();
 </script>
 </body>
 </html>"""
-
 
 def serve_phone_dashboard():
     from http.server import HTTPServer, BaseHTTPRequestHandler
